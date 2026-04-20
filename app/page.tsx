@@ -1,26 +1,28 @@
 'use client';
 
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef } from 'react';
 import Lenis from 'lenis';
-import { CafeMenuOverlay } from './components/CafeMenu';
 
-/* ─── Config ────────────────────────────────────────────────────────────── */
-const FRAME_COUNT  = 270;
+const FRAME_COUNT = 270;
 const FRAME_DIGITS = 3;
-const FRAME_ZONE   = 0.80;   // 0→80% of scroll plays frames 0→269
-const MENU_START   = 0.75;   // menu overlay begins fading in at 75%
-const MAX_DPR      = 2;      // cap for performance
 
-const pad     = (n: number, d: number) => String(n).padStart(d, '0');
-const frameSrc = (i: number) => `/frames/ezgif-frame-${pad(i + 1, FRAME_DIGITS)}.jpg`;
-const clamp01  = (n: number) => Math.min(1, Math.max(0, n));
+// Helper to format frame numbers (1 -> 001)
+function padLeft(num: number, digits: number) {
+  return String(num).padStart(digits, '0');
+}
 
-/* ─── Main ──────────────────────────────────────────────────────────────── */
-export default function HeroFramesWheel() {
-  const heroRef   = useRef<HTMLElement>(null);
+export default function ZedCafeFramesWheel() {
+  const heroRef = useRef<HTMLElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const wrapRef   = useRef<HTMLDivElement>(null);
-  const [menuProgress, setMenuProgress] = useState(0);
+  const wrapRef = useRef<HTMLDivElement>(null);
+  const headerRef = useRef<HTMLElement>(null);
+
+  const paths = useMemo(() => {
+    const getSrc = (frameIndex: number) => {
+      return `/frames/ezgif-frame-${padLeft(frameIndex + 1, FRAME_DIGITS)}.jpg`;
+    };
+    return { getSrc };
+  }, []);
 
   useEffect(() => {
     const heroEl = heroRef.current;
@@ -30,429 +32,381 @@ export default function HeroFramesWheel() {
     const ctx = canvas.getContext('2d', { alpha: false });
     if (!ctx) return;
 
-    /* Lenis — buttery smooth scroll */
+    // 1. Initialize Lenis (Buttery smooth scrolling)
     const lenis = new Lenis({
-      duration: 1.4,
+      duration: 1.8,
       smoothWheel: true,
       easing: (t) => Math.min(1, 1.001 - Math.pow(2, -10 * t)),
     });
 
     let destroyed = false;
 
-    /* ── Storage ──────────────────────────────────────────────────────── */
-    // ImageBitmap = GPU-ready, drawImage is near-instant (no CPU decode on draw)
-    const bitmaps: (ImageBitmap | HTMLImageElement | null)[] = new Array(FRAME_COUNT).fill(null);
-    const requested = new Uint8Array(FRAME_COUNT); // 0 = not requested, 1 = requested
+    // 2. Setup Memory Arrays
+    const frames: (HTMLImageElement | null)[] = new Array(FRAME_COUNT).fill(null);
+    const frameReady: boolean[] = new Array(FRAME_COUNT).fill(false);
+    const requested: boolean[] = new Array(FRAME_COUNT).fill(false);
 
-    /* ── Frame Loader ─────────────────────────────────────────────────── */
+    const clamp01 = (n: number) => Math.min(1, Math.max(0, n));
+
+    // 3. Smart Preloader
     const loadFrame = (idx: number) => {
-      if (idx < 0 || idx >= FRAME_COUNT || requested[idx]) return;
-      requested[idx] = 1;
+      if (requested[idx] || idx < 0 || idx >= FRAME_COUNT) return;
+      requested[idx] = true;
 
       const img = new Image();
       img.decoding = 'async';
-      img.src = frameSrc(idx);
+      img.src = paths.getSrc(idx);
+      frames[idx] = img;
 
-      const store = () => {
+      const markReady = () => {
         if (destroyed) return;
-        if (typeof createImageBitmap !== 'undefined') {
-          createImageBitmap(img)
-            .then(bm => { if (!destroyed) bitmaps[idx] = bm; })
-            .catch(() => { if (!destroyed) bitmaps[idx] = img; });
-        } else {
-          bitmaps[idx] = img;
+        frameReady[idx] = true;
+        if (idx === 0) {
+          drawCover(img);
         }
       };
 
-      if (img.decode) {
-        img.decode().then(store).catch(store);
+      img.onload = markReady;
+      img.decode?.().then(markReady).catch(() => {});
+    };
+
+    const preloadWindow = (center: number, radius: number) => {
+      for (let d = -radius; d <= radius; d++) {
+        const raw = center + d;
+        if (raw >= 0 && raw < FRAME_COUNT) {
+          loadFrame(raw);
+        }
+      }
+    };
+
+    preloadWindow(0, 12);
+    for (let i = 0; i < Math.min(FRAME_COUNT, 60); i++) loadFrame(i);
+
+    const scheduleBackgroundPreload = () => {
+      const run = () => {
+        if (destroyed) return;
+        for (let i = 0; i < FRAME_COUNT; i++) loadFrame(i);
+      };
+      if (typeof window !== 'undefined' && 'requestIdleCallback' in window) {
+        (window as any).requestIdleCallback(run, { timeout: 1500 });
       } else {
-        img.onload = store;
+        setTimeout(run, 250);
       }
     };
+    scheduleBackgroundPreload();
 
-    /* ── Priority Bootstrap ───────────────────────────────────────────── */
-    // Load first 20 immediately for instant first paint
-    for (let i = 0; i < Math.min(20, FRAME_COUNT); i++) loadFrame(i);
-
-    // Load everything else during browser idle time
-    const idleLoad = () => {
-      if (destroyed) return;
-      for (let i = 0; i < FRAME_COUNT; i++) loadFrame(i);
-    };
-    if ('requestIdleCallback' in window) {
-      (window as any).requestIdleCallback(idleLoad, { timeout: 800 });
-    } else {
-      setTimeout(idleLoad, 120);
-    }
-
-    /* ── Canvas Resize (capped DPR for perf) ─────────────────────────── */
-    const needsRedraw = { current: true };
+    // 4. Handle High-DPI Displays (Retina screens)
     const resize = () => {
-      const dpr  = Math.min(window.devicePixelRatio || 1, MAX_DPR);
+      const dpr = window.devicePixelRatio || 1;
       const rect = canvas.getBoundingClientRect();
-      const w    = Math.max(1, Math.round(rect.width  * dpr));
-      const h    = Math.max(1, Math.round(rect.height * dpr));
+      const w = Math.max(1, Math.floor(rect.width * dpr));
+      const h = Math.max(1, Math.floor(rect.height * dpr));
       if (canvas.width !== w || canvas.height !== h) {
-        canvas.width  = w;
+        canvas.width = w;
         canvas.height = h;
-        needsRedraw.current = true;
       }
     };
-    resize();
 
-    const ro = new ResizeObserver(() => { resize(); needsRedraw.current = true; });
+    const needsRedrawRef = { current: true };
+    resize();
+    
+    const ro = new ResizeObserver(() => {
+      resize();
+      needsRedrawRef.current = true;
+    });
     ro.observe(canvas);
 
-    /* ── drawCover: object-fit: cover math ───────────────────────────── */
-    const drawCover = (bm: ImageBitmap | HTMLImageElement) => {
-      const cw = canvas.width, ch = canvas.height;
+    // 5. Canvas Drawing Math (Acts like object-fit: cover)
+    const drawCover = (img: HTMLImageElement) => {
+      const cw = canvas.width;
+      const ch = canvas.height;
       if (!cw || !ch) return;
-      const iw = (bm as HTMLImageElement).naturalWidth  || (bm as ImageBitmap).width  || 0;
-      const ih = (bm as HTMLImageElement).naturalHeight || (bm as ImageBitmap).height || 0;
+
+      const iw = img.naturalWidth || img.width;
+      const ih = img.naturalHeight || img.height;
       if (!iw || !ih) return;
+
       const scale = Math.max(cw / iw, ch / ih);
-      const dw = iw * scale, dh = ih * scale;
-      ctx.drawImage(bm as CanvasImageSource, (cw - dw) / 2, (ch - dh) / 2, dw, dh);
+      const dw = iw * scale;
+      const dh = ih * scale;
+      const dx = (cw - dw) / 2;
+      const dy = (ch - dh) / 2;
+
+      ctx.clearRect(0, 0, cw, ch);
+      ctx.drawImage(img, dx, dy, dw, dh);
     };
 
-    /* ── Sub-frame Blending ───────────────────────────────────────────── *
-     * Instead of snapping to the nearest frame, we cross-fade between    *
-     * floor and ceil frames using globalAlpha. This is what makes it     *
-     * feel completely filmlike — zero stepping sensation.                *
-     * ─────────────────────────────────────────────────────────────────── */
-    const drawBlended = (frameFloat: number) => {
-      const lo    = Math.max(0, Math.min(FRAME_COUNT - 2, Math.floor(frameFloat)));
-      const hi    = lo + 1;
-      const alpha = frameFloat - lo; // 0.0 → 1.0
+    const lastFrameRef = { current: -1 };
 
-      const bmLo = bitmaps[lo];
-      const bmHi = bitmaps[hi];
-
-      if (!bmLo && !bmHi) return;
-
-      ctx.globalAlpha = 1;
-      if (bmLo) drawCover(bmLo);
-
-      if (bmHi && alpha > 0.004) {
-        ctx.globalAlpha = alpha;
-        drawCover(bmHi);
-        ctx.globalAlpha = 1;
+    const findNearestReady = (idx: number, radius: number) => {
+      if (frameReady[idx]) return idx;
+      for (let d = 1; d <= radius; d++) {
+        const left = Math.max(0, idx - d);
+        const right = Math.min(FRAME_COUNT - 1, idx + d);
+        if (frameReady[left]) return left;
+        if (frameReady[right]) return right;
       }
+      return -1;
     };
 
-    /* ── Smooth lerped frame position ─────────────────────────────────── */
-    let smoothFrame  = 0;
-    let lastDrawFrame = -1;
-
-    /* ── RAF Tick ─────────────────────────────────────────────────────── */
+    // 6. The Core Render Loop
     let rafId = 0;
-
     const tick = (time: number) => {
       if (destroyed) return;
+
       lenis.raf(time);
 
-      const start   = heroEl.offsetTop;
-      const end     = start + heroEl.offsetHeight - window.innerHeight;
-      const scrollY = (lenis as any).scroll ?? window.scrollY;
-      const t       = clamp01((scrollY - start) / Math.max(1, end - start));
+      const start = heroEl.offsetTop;
+      const end = start + heroEl.offsetHeight - window.innerHeight;
+      const denom = Math.max(1, end - start);
 
-      // Map first FRAME_ZONE% of scroll → full frame range
-      const frameT      = clamp01(t / FRAME_ZONE);
-      const targetFrame = frameT * (FRAME_COUNT - 1);
+      const scrollY = lenis.scroll ?? window.scrollY ?? 0;
+      const t = clamp01((scrollY - start) / denom);
 
-      // Lerp smoothly toward target — eliminates all stepping/stuttering
-      smoothFrame += (targetFrame - smoothFrame) * 0.15;
+      const frameFloat = t * (FRAME_COUNT - 1);
+      const idx = Math.min(FRAME_COUNT - 1, Math.max(0, Math.round(frameFloat)));
 
-      // Preload ahead of current position
-      const ci = Math.round(smoothFrame);
-      for (let d = -15; d <= 25; d++) {
-        const raw = ci + d;
-        if (raw >= 0 && raw < FRAME_COUNT) loadFrame(raw);
-      }
+      preloadWindow(idx, 18);
 
-      // Subtle parallax on canvas wrapper
+      // Parallax update
       if (wrapRef.current) {
-        const s = 1.08 - t * 0.04;
-        const r = (t - 0.5) * -0.8;
-        wrapRef.current.style.transform = `scale(${s}) rotate(${r}deg)`;
+        const scale = 1.10 - t * 0.04;
+        const rotate = (t - 0.5) * -1.0;
+        wrapRef.current.style.transform = `scale(${scale}) rotate(${rotate}deg)`;
       }
 
-      // Draw only if frame moved meaningfully or canvas was resized
-      if (Math.abs(smoothFrame - lastDrawFrame) > 0.01 || needsRedraw.current) {
-        drawBlended(smoothFrame);
-        lastDrawFrame = smoothFrame;
-        needsRedraw.current = false;
+      // Header Background Toggle Logic
+      if (headerRef.current) {
+        const pastHero = scrollY > end - 50; // trigger slightly before it completely unpins
+        if (pastHero) {
+          headerRef.current.style.backgroundColor = 'rgba(8, 8, 8, 0.85)';
+          headerRef.current.style.backdropFilter = 'blur(16px)';
+          headerRef.current.style.borderBottom = '1px solid rgba(255, 255, 255, 0.05)';
+        } else {
+          headerRef.current.style.backgroundColor = 'transparent';
+          headerRef.current.style.backdropFilter = 'none';
+          headerRef.current.style.borderBottom = '1px solid transparent';
+        }
       }
 
-      // Menu overlay progress (0 → 1 in scroll range MENU_START → 1.0)
-      const mp = clamp01((t - MENU_START) / (1 - MENU_START));
-      setMenuProgress(mp);
+      const drawIdx = findNearestReady(idx, 24);
+      if (
+        drawIdx !== -1 &&
+        (drawIdx !== lastFrameRef.current || needsRedrawRef.current)
+      ) {
+        lastFrameRef.current = drawIdx;
+        drawCover(frames[drawIdx]!);
+        needsRedrawRef.current = false;
+      }
 
       rafId = requestAnimationFrame(tick);
     };
 
     rafId = requestAnimationFrame(tick);
 
+    // 7. Cleanup
     return () => {
       destroyed = true;
       lenis.destroy();
       cancelAnimationFrame(rafId);
       ro.disconnect();
-      bitmaps.forEach(bm => {
-        if (bm && typeof (bm as ImageBitmap).close === 'function') {
-          (bm as ImageBitmap).close(); // free GPU memory
-        }
-      });
     };
-  }, []);
+  }, [paths]);
 
   return (
-    <>
-      {/* ── Google Fonts ── */}
-      <style>{`
-        @import url('https://fonts.googleapis.com/css2?family=Playfair+Display:wght@400;600;700;800&family=Inter:wght@300;400;500;600&display=swap');
-
-        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-
-        html { scroll-behavior: auto; } /* Lenis handles this */
-
-        body {
-          background: #080808;
-          font-family: 'Inter', system-ui, sans-serif;
-          -webkit-font-smoothing: antialiased;
-          overscroll-behavior: none;
-        }
-
-        /* Custom scrollbar */
-        ::-webkit-scrollbar { width: 4px; }
-        ::-webkit-scrollbar-track { background: #0a0a0a; }
-        ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.15); border-radius: 4px; }
-        ::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.3); }
-
-        /* Menu cards horizontal scroll */
-        .menu-scroll {
-          display: flex;
-          gap: 20px;
-          padding: 0 48px 24px;
-          overflow-x: auto;
-          scroll-snap-type: x mandatory;
-          scrollbar-width: none;
-          -ms-overflow-style: none;
-        }
-        .menu-scroll::-webkit-scrollbar { display: none; }
-        .menu-scroll > * { scroll-snap-align: center; }
-
-        /* Floating ambient orbs */
-        @keyframes orb-float {
-          0%, 100% { transform: translateY(0) scale(1); }
-          50%       { transform: translateY(-18px) scale(1.06); }
-        }
-        .orb { animation: orb-float 7s ease-in-out infinite; }
-        .orb:nth-child(2) { animation-delay: -3.5s; }
-
-        /* Menu section fade-slide */
-        @keyframes menu-in {
-          from { opacity: 0; transform: translateY(30px); }
-          to   { opacity: 1; transform: translateY(0); }
-        }
-
-        /* ── Mobile Responsiveness Overrides ── */
-        @media (max-width: 768px) {
-          .hero-header {
-            padding: 20px 24px !important;
-            flex-direction: column !important;
-            align-items: flex-start !important;
-            gap: 16px;
+    <main style={{ position: 'relative', width: '100%', background: '#080808', color: '#fff' }}>
+      
+      {/* ── Hero Brand Text (Fixed at top, dynamically styled on scroll) ── */}
+      <header 
+  ref={headerRef} 
+  style={{
+    position: 'fixed', top: 0, left: 0, right: 0,
+    display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+    padding: '28px 48px', zIndex: 50, 
+    transition: 'background-color 0.4s ease, backdrop-filter 0.4s ease, border-color 0.4s ease',
+    borderBottom: '1px solid transparent'
+  }}
+>
+  <div>
+    <p style={{
+      fontSize: 11, letterSpacing: '0.25em', textTransform: 'uppercase',
+      color: 'rgba(255,255,255,0.45)', fontWeight: 500, marginBottom: '4px'
+    }}>Est. 2019</p>
+    <h1 style={{
+      fontSize: 22, fontWeight: 800, color: '#fff', letterSpacing: '-0.02em',
+      fontFamily: '"Playfair Display", Georgia, serif', margin: 0
+    }}>ZED CAFÉ</h1>
+  </div>
+  <nav className="hero-nav" style={{ display: 'flex', gap: 32 }}>
+    {['Menu', 'Story', 'Reserve'].map(item => (
+      <a 
+        key={item} 
+        href={`#${item.toLowerCase()}`}
+        onClick={(e) => {
+          e.preventDefault();
+          const target = document.getElementById(item.toLowerCase());
+          if (target) {
+            target.scrollIntoView({ behavior: 'smooth' });
           }
-          .hero-nav {
-            gap: 20px !important;
-          }
-          .menu-header-container {
-            padding: 0 24px 20px !important;
-          }
-          .menu-title-text {
-            font-size: 34px !important;
-          }
-          .menu-scroll {
-            padding: 0 24px 16px !important;
-            gap: 12px;
-          }
-          .bottom-tagline {
-            padding: 16px 24px 24px !important;
-            flex-direction: column !important;
-            align-items: flex-start !important;
-            gap: 16px;
-          }
-          .orb-1 { width: 200px !important; height: 200px !important; top: 10% !important; }
-          .orb-2 { width: 160px !important; height: 160px !important; right: -10% !important; }
-        }
-      `}</style>
+        }}
+        style={{
+          fontSize: 13, color: 'rgba(255,255,255,0.55)', letterSpacing: '0.05em',
+          fontWeight: 500, cursor: 'pointer', pointerEvents: 'auto', transition: 'color 0.2s',
+          textDecoration: 'none'
+        }}
+        onMouseOver={(e) => e.currentTarget.style.color = '#fff'}
+        onMouseOut={(e) => e.currentTarget.style.color = 'rgba(255,255,255,0.55)'}
+      >
+        {item}
+      </a>
+    ))}
+  </nav>
+</header>
 
-      <main style={{ position: 'relative', width: '100%', background: '#080808', color: '#fff' }}>
+      {/* ══════════════════════════════════════════════════════════════
+          HERO — scroll-synced frame animation + menu overlay
+      ══════════════════════════════════════════════════════════════ */}
+      <section
+        ref={heroRef}
+        style={{ position: 'relative', height: '500vh', width: '100%', background: '#080808' }}
+      >
+        <div style={{ position: 'sticky', top: 0, zIndex: 10, height: '100vh', width: '100%', overflow: 'hidden' }}>
+          
+          {/* Canvas wrapper with parallax */}
+          <div ref={wrapRef} style={{ position: 'absolute', inset: 0, willChange: 'transform' }}>
+            <canvas
+              ref={canvasRef}
+              style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', display: 'block' }}
+            />
 
-        {/* ══════════════════════════════════════════════════════════════
-            HERO — scroll-synced frame animation + menu overlay
-        ══════════════════════════════════════════════════════════════ */}
-        <section
-          ref={heroRef}
-          style={{ position: 'relative', height: '500vh', width: '100%', background: '#080808' }}
-        >
-          <div style={{ position: 'sticky', top: 0, zIndex: 10, height: '100vh', width: '100%', overflow: 'hidden' }}>
-
-            {/* Canvas wrapper with parallax */}
-            <div ref={wrapRef} style={{ position: 'absolute', inset: 0, willChange: 'transform' }}>
-              <canvas
-                ref={canvasRef}
-                style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', display: 'block' }}
-              />
-
-              {/* Vignette gradient */}
-              <div style={{
-                position: 'absolute', inset: 0,
-                background: 'linear-gradient(to bottom, rgba(0,0,0,0.18) 0%, rgba(0,0,0,0.22) 60%, rgba(0,0,0,0.88) 100%)',
-                pointerEvents: 'none',
-              }} />
-              {/* Radial light bloom */}
-              <div style={{
-                position: 'absolute', inset: 0,
-                background: 'radial-gradient(55% 55% at 50% 42%, rgba(255,255,255,0.07), transparent 65%)',
-                pointerEvents: 'none',
-              }} />
-            </div>
-
-            {/* ── Hero Brand Text (always visible at top) ── */}
-            <div className="hero-header" style={{
-              position: 'absolute', top: 0, left: 0, right: 0,
-              display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-              padding: '28px 48px', zIndex: 20, pointerEvents: 'none',
-            }}>
-              <div>
-                <p style={{
-                  fontSize: 11, letterSpacing: '0.25em', textTransform: 'uppercase',
-                  color: 'rgba(255,255,255,0.45)', fontWeight: 500,
-                }}>Est. 2019</p>
-                <h1 style={{
-                  fontSize: 22, fontWeight: 800, color: '#fff', letterSpacing: '-0.02em',
-                  fontFamily: '"Playfair Display", Georgia, serif',
-                }}>LUMIÈRE CAFÉ</h1>
-              </div>
-              <nav className="hero-nav" style={{ display: 'flex', gap: 32 }}>
-                {['Menu', 'Story', 'Reserve'].map(item => (
-                  <span key={item} style={{
-                    fontSize: 13, color: 'rgba(255,255,255,0.55)', letterSpacing: '0.05em',
-                    fontWeight: 500, cursor: 'pointer', pointerEvents: 'auto', transition: 'color 0.2s',
-                  }}>{item}</span>
-                ))}
-              </nav>
-            </div>
-
-            {/* ── Scroll hint (fades out as user scrolls) ── */}
+            {/* Vignette gradient */}
             <div style={{
-              position: 'absolute', bottom: 40, left: '50%', transform: 'translateX(-50%)',
-              display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 8,
-              zIndex: 20, pointerEvents: 'none',
-              opacity: Math.max(0, 1 - menuProgress * 4),
-              transition: 'opacity 0.3s',
-            }}>
-              <p style={{ fontSize: 11, letterSpacing: '0.2em', color: 'rgba(255,255,255,0.4)', textTransform: 'uppercase' }}>
-                Scroll to explore
-              </p>
-              <div style={{
-                width: 1, height: 48,
-                background: 'linear-gradient(to bottom, rgba(255,255,255,0.4), transparent)',
-                animation: 'orb-float 1.8s ease-in-out infinite',
-              }} />
-            </div>
-
-            {/* ══════════════════════════════════════════════════════════
-                MENU OVERLAY — fades in at end of frame animation
-            ══════════════════════════════════════════════════════════ */}
+              position: 'absolute', inset: 0,
+              background: 'linear-gradient(to bottom, rgba(0,0,0,0.18) 0%, rgba(0,0,0,0.22) 60%, rgba(0,0,0,0.88) 100%)',
+              pointerEvents: 'none',
+            }} />
+            
+            {/* Radial light bloom */}
             <div style={{
-              position: 'absolute', inset: 0, zIndex: 30,
-              opacity: menuProgress,
-              pointerEvents: menuProgress > 0.1 ? 'auto' : 'none',
-              transition: 'opacity 0.1s',
-              display: 'flex', flexDirection: 'column', justifyContent: 'flex-end',
-              paddingBottom: 0,
-            }}>
-              {/* Frosted bottom gradient */}
-              <div style={{
-                position: 'absolute', inset: 0,
-                background: 'linear-gradient(to top, rgba(4,4,8,0.92) 0%, rgba(4,4,8,0.6) 50%, transparent 100%)',
-                pointerEvents: 'none',
-              }} />
-
-              {/* Ambient orbs */}
-              <div className="orb orb-1" style={{
-                position: 'absolute', top: '18%', left: '10%',
-                width: 300, height: 300, borderRadius: '50%',
-                background: 'radial-gradient(circle, rgba(200,134,10,0.18), transparent 70%)',
-                filter: 'blur(40px)', pointerEvents: 'none',
-              }} />
-              <div className="orb orb-2" style={{
-                position: 'absolute', top: '25%', right: '8%',
-                width: 260, height: 260, borderRadius: '50%',
-                background: 'radial-gradient(circle, rgba(139,92,246,0.15), transparent 70%)',
-                filter: 'blur(40px)', pointerEvents: 'none',
-              }} />
-
-              {/* Menu header */}
-              <div className="menu-header-container" style={{
-                position: 'relative', zIndex: 2,
-                padding: '0 48px 24px',
-                opacity: menuProgress,
-                transform: `translateY(${(1 - menuProgress) * 20}px)`,
-                transition: 'all 0.4s ease',
-              }}>
-                <p style={{
-                  fontSize: 11, letterSpacing: '0.22em', textTransform: 'uppercase',
-                  color: 'rgba(255,255,255,0.4)', marginBottom: 6, fontWeight: 500,
-                }}>Curated Selection</p>
-                <h2 className="menu-title-text" style={{
-                  fontSize: 42, fontWeight: 800, color: '#fff', letterSpacing: '-0.03em',
-                  fontFamily: '"Playfair Display", Georgia, serif', lineHeight: 1,
-                }}>Our Menu</h2>
-              </div>
-
-              {/* Cards horizontal scroll */}
-              <div>
-                <CafeMenuOverlay progress={menuProgress} />
-              </div>
-
-              {/* Bottom tagline */}
-              <div className="bottom-tagline" style={{
-                position: 'relative', zIndex: 2,
-                padding: '18px 48px 32px',
-                display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-                opacity: menuProgress,
-                transform: `translateY(${(1 - menuProgress) * 10}px)`,
-                transition: 'all 0.5s ease 0.2s',
-              }}>
-                <p style={{ fontSize: 12, color: 'rgba(255,255,255,0.3)', letterSpacing: '0.05em' }}>
-                  Tap any card to reveal nutrition facts
-                </p>
-                <div style={{
-                  display: 'flex', alignItems: 'center', gap: 10,
-                  padding: '10px 20px', borderRadius: 50,
-                  background: 'rgba(255,255,255,0.08)',
-                  backdropFilter: 'blur(16px)',
-                  border: '1px solid rgba(255,255,255,0.12)',
-                  cursor: 'pointer',
-                }}>
-                  <span style={{ fontSize: 13, color: '#fff', fontWeight: 500 }}>Reserve a Table</span>
-                  <span style={{ fontSize: 14 }}>→</span>
-                </div>
-              </div>
-
-            </div>
-            {/* end menu overlay */}
-
+              position: 'absolute', inset: 0,
+              background: 'radial-gradient(55% 55% at 50% 42%, rgba(255,255,255,0.07), transparent 65%)',
+              pointerEvents: 'none',
+            }} />
           </div>
-        </section>
-        {/* end hero */}
+        </div>
+      </section>
 
-      </main>
-    </>
+      {/* ══════════════════════════════════════════════════════════════
+          SECTION 2: HIGHLIGHTS
+      ══════════════════════════════════════════════════════════════ */}
+      <section className="relative -mt-px w-full py-32 px-6 lg:px-12 z-20" style={{ background: '#080808' }}>
+        <div className="max-w-6xl mx-auto">
+          <div className="text-center mb-20">
+            <h2 className="text-4xl md:text-5xl font-bold mb-4 font-serif tracking-tight text-white">The Zed Experience</h2>
+            <div className="w-16 h-[1px] bg-white/20 mx-auto"></div>
+          </div>
+          
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-12 text-center">
+            {/* Highlight 1 */}
+            <div className="flex flex-col items-center group">
+              <div className="w-24 h-24 rounded-full border border-white/10 flex items-center justify-center mb-6 transition duration-500 group-hover:border-white/40 group-hover:bg-white/5">
+                <svg className="w-8 h-8 text-white/70" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M5 8h14M5 8a2 2 0 110-4h14a2 2 0 110 4M5 8v10a2 2 0 002 2h10a2 2 0 002-2V8m-9 4h4" /></svg>
+              </div>
+              <h3 className="text-xl font-semibold mb-3 tracking-wide text-white/90">Artisanal Roasts</h3>
+              <p className="text-white/50 leading-relaxed text-sm">
+                Ethically sourced beans roasted in-house daily to ensure the freshest, most vibrant flavor profiles.
+              </p>
+            </div>
+
+            {/* Highlight 2 */}
+            <div className="flex flex-col items-center group">
+              <div className="w-24 h-24 rounded-full border border-white/10 flex items-center justify-center mb-6 transition duration-500 group-hover:border-white/40 group-hover:bg-white/5">
+                <svg className="w-8 h-8 text-white/70" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
+              </div>
+              <h3 className="text-xl font-semibold mb-3 tracking-wide text-white/90">Slow Poured</h3>
+              <p className="text-white/50 leading-relaxed text-sm">
+                Crafted with patience and precision. We believe that a truly excellent cup of coffee takes exactly the time it needs.
+              </p>
+            </div>
+
+            {/* Highlight 3 */}
+            <div className="flex flex-col items-center group">
+              <div className="w-24 h-24 rounded-full border border-white/10 flex items-center justify-center mb-6 transition duration-500 group-hover:border-white/40 group-hover:bg-white/5">
+                <svg className="w-8 h-8 text-white/70" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M21 15.546c-.523 0-1.046.151-1.5.454a2.704 2.704 0 01-3 0 2.704 2.704 0 00-3 0 2.704 2.704 0 01-3 0 2.704 2.704 0 00-3 0 2.704 2.704 0 01-3 0 2.701 2.701 0 00-1.5-.454M9 6v2m3-2v2m3-2v2M9 3h.01M12 3h.01M15 3h.01M21 21v-7a2 2 0 00-2-2H5a2 2 0 00-2 2v7h18zm-3-9v-2a2 2 0 00-2-2H8a2 2 0 00-2 2v2h12z" /></svg>
+              </div>
+              <h3 className="text-xl font-semibold mb-3 tracking-wide text-white/90">Fresh Patisserie</h3>
+              <p className="text-white/50 leading-relaxed text-sm">
+                A daily rotating selection of delicate pastries, baked fresh every morning from local ingredients.
+              </p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      {/* ══════════════════════════════════════════════════════════════
+          SECTION 3: MENU
+      ══════════════════════════════════════════════════════════════ */}
+        <section id="menu" className="relative w-full py-32 px-6 lg:px-12 z-20" style={{ background: '#0a0a0a' }}>
+          <div className="max-w-4xl mx-auto">
+          <div className="text-center mb-16">
+            <h2 className="text-3xl md:text-4xl font-bold mb-4 font-serif tracking-tight text-white">Curated Menu</h2>
+            <p className="text-white/40 text-sm tracking-widest uppercase">Classics & Signatures</p>
+          </div>
+
+          <div className="space-y-16">
+            {/* Coffee Sub-menu */}
+            <div>
+              <h3 className="text-xl font-medium border-b border-white/10 pb-4 mb-6 text-white/80">Coffee</h3>
+              <ul className="space-y-6">
+                <li className="flex justify-between items-end group">
+                  <div className="flex-1 border-b border-dashed border-white/20 mb-1 mr-4">
+                    <span className="bg-[#0a0a0a] pr-4 text-white/90 font-medium tracking-wide">Zed Signature Pour Over</span>
+                  </div>
+                  <span className="text-white/70 font-serif">650</span>
+                </li>
+                <li className="flex justify-between items-end">
+                  <div className="flex-1 border-b border-dashed border-white/20 mb-1 mr-4">
+                    <span className="bg-[#0a0a0a] pr-4 text-white/90 font-medium tracking-wide">Madagascar Vanilla Latte</span>
+                  </div>
+                  <span className="text-white/70 font-serif">575</span>
+                </li>
+                <li className="flex justify-between items-end">
+                  <div className="flex-1 border-b border-dashed border-white/20 mb-1 mr-4">
+                    <span className="bg-[#0a0a0a] pr-4 text-white/90 font-medium tracking-wide">Oat Flat White</span>
+                  </div>
+                  <span className="text-white/70 font-serif">450</span>
+                </li>
+              </ul>
+            </div>
+
+            {/* Pastries Sub-menu */}
+            <div>
+              <h3 className="text-xl font-medium border-b border-white/10 pb-4 mb-6 text-white/80">Patisserie</h3>
+              <ul className="space-y-6">
+                <li className="flex justify-between items-end">
+                  <div className="flex-1 border-b border-dashed border-white/20 mb-1 mr-4">
+                    <span className="bg-[#0a0a0a] pr-4 text-white/90 font-medium tracking-wide">Twice-Baked Almond Croissant</span>
+                  </div>
+                  <span className="text-white/70 font-serif">480</span>
+                </li>
+                <li className="flex justify-between items-end">
+                  <div className="flex-1 border-b border-dashed border-white/20 mb-1 mr-4">
+                    <span className="bg-[#0a0a0a] pr-4 text-white/90 font-medium tracking-wide">Pistachio Rose Cruffin</span>
+                  </div>
+                  <span className="text-white/70 font-serif">550</span>
+                </li>
+                <li className="flex justify-between items-end">
+                  <div className="flex-1 border-b border-dashed border-white/20 mb-1 mr-4">
+                    <span className="bg-[#0a0a0a] pr-4 text-white/90 font-medium tracking-wide">Matcha White Chocolate Cookie</span>
+                  </div>
+                  <span className="text-white/70 font-serif">350</span>
+                </li>
+              </ul>
+            </div>
+          </div>
+        </div>
+      </section>
+
+    </main>
   );
 }
